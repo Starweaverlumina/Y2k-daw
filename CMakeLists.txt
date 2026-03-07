@@ -159,6 +159,7 @@ endmacro()
 # ─────────────────────────────────────────────────────────────────
 y2k_subdir(engine/y2k_dsp)
 y2k_subdir(engine/y2k_engine)
+y2k_subdir(engine/session)   # SessionDocument layer (above y2k_engine)
 y2k_subdir(ui/y2k_ui)
 y2k_subdir(app)
 
