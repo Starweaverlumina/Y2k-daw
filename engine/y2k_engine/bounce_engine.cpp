@@ -70,9 +70,12 @@ BounceEngine::BounceResult BounceEngine::bounce(y2k::dsp::ProcessGraph& graph,
     }
 
     // juce::WavAudioFormat::createWriterFor takes ownership of the stream
+    // on success. We must NOT release fileStream until we know the writer was
+    // created (otherwise a failed createWriterFor leaves a dangling stream).
+    juce::FileOutputStream* rawStream = fileStream.get();
     std::unique_ptr<juce::AudioFormatWriter> writer(
         wavFormat.createWriterFor(
-            fileStream.get(),
+            rawStream,
             params.sampleRate,
             static_cast<unsigned int>(params.numChannels),
             params.bitDepth,
@@ -81,10 +84,12 @@ BounceEngine::BounceResult BounceEngine::bounce(y2k::dsp::ProcessGraph& graph,
 
     if (!writer) {
         result.error = "Cannot create WAV writer for: " + params.outputFile.getFullPathName();
+        // fileStream still owns the raw pointer — let unique_ptr clean it up
         return result;
     }
 
-    // Writer took ownership of the stream — release our ownership
+    // Writer took ownership of the stream — release our unique_ptr's ownership
+    // so it is not double-freed when fileStream goes out of scope.
     fileStream.release();
 
     // ── Prepare graph ──────────────────────────────────────────────

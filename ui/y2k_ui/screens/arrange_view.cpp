@@ -2,6 +2,7 @@
 #include "theme.h"                    // y2k_ui PUBLIC include root
 
 #include <cmath>
+#include <algorithm>
 
 namespace y2k::ui {
 
@@ -55,10 +56,76 @@ void ArrangeView::buildDefaultTracks() {
         Track t;
         t.name  = defs[i].name;
         t.color = trackColor(i);
-        for (const auto& cd : defs[i].clips)
-            t.clips.push_back({ cd.s, cd.l, cd.lbl, defs[i].midi });
+        for (const auto& cd : defs[i].clips) {
+            Clip c;
+            c.startBeat = cd.s;
+            c.lenBeats  = cd.l;
+            c.label     = cd.lbl;
+            c.isMidi    = defs[i].midi;
+            t.clips.push_back(std::move(c));
+        }
         tracks_.push_back(std::move(t));
     }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  Session wiring
+// ─────────────────────────────────────────────────────────────────
+
+void ArrangeView::setSession(y2k::engine::Y2KSession*        session,
+                              y2k::engine::ProjectRouting*    routing,
+                              y2k::engine::SessionCommandBus* bus)
+{
+    session_ = session;
+    routing_ = routing;
+    cmdBus_  = bus;
+
+    // Rebuild the default demo tracks first (preserves visual state)
+    buildDefaultTracks();
+
+    // If routing is available, mirror session track names/mute/solo
+    // into the internal tracks_ array.
+    if (routing_ != nullptr) {
+        const int nRouting = static_cast<int>(routing_->tracks.size());
+        const int nInternal = static_cast<int>(tracks_.size());
+        const int nMirror = std::min(nRouting, nInternal);
+
+        for (int i = 0; i < nMirror; ++i) {
+            const auto& tm = routing_->tracks[i];
+            tracks_[i].sessionTrackId = tm.id.toString();
+            // Only override name if session has a meaningful one
+            if (tm.name.isNotEmpty())
+                tracks_[i].name = tm.name;
+            tracks_[i].muted  = tm.muted;
+            tracks_[i].soloed = tm.soloed;
+            tracks_[i].volume = tm.volume;
+        }
+    }
+
+    // Mirror session clip positions if session is available
+    if (session_ != nullptr && routing_ != nullptr) {
+        const int nTracks = static_cast<int>(tracks_.size());
+        for (int i = 0; i < nTracks && i < (int)session_->tracks.size(); ++i) {
+            auto& sessionTrack = *session_->tracks[i];
+            auto& internalTrack = tracks_[i];
+
+            // If session track has clips, replace demo clips with session clips
+            if (!sessionTrack.clips.empty()) {
+                internalTrack.clips.clear();
+                for (auto& sc : sessionTrack.clips) {
+                    Clip c;
+                    c.sessionClipId = sc->id.toString();
+                    c.startBeat     = sc->startBeat;
+                    c.lenBeats      = sc->durationBeats;
+                    c.label         = sc->name;
+                    c.isMidi        = (sc->getType() == "MIDI");
+                    internalTrack.clips.push_back(std::move(c));
+                }
+            }
+        }
+    }
+
+    repaint();
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -122,6 +189,24 @@ juce::Rectangle<int> ArrangeView::laneBounds(int row) const noexcept {
     return { kHeaderW, kRulerH + row * kTrackH, getWidth() - kHeaderW, kTrackH };
 }
 
+int ArrangeView::rowAtY(int y) const noexcept {
+    if (y < kRulerH) return -1;
+    const int row = (y - kRulerH) / kTrackH;
+    if (row < 0 || row >= (int)tracks_.size()) return -1;
+    return row;
+}
+
+int ArrangeView::clipIndexAtBeat(int trackIdx, double beat) const noexcept {
+    if (trackIdx < 0 || trackIdx >= (int)tracks_.size()) return -1;
+    const auto& clips = tracks_[trackIdx].clips;
+    for (int i = 0; i < (int)clips.size(); ++i) {
+        const auto& c = clips[i];
+        if (beat >= c.startBeat && beat < c.startBeat + c.lenBeats)
+            return i;
+    }
+    return -1;
+}
+
 // ─────────────────────────────────────────────────────────────────
 //  paint / resized
 // ─────────────────────────────────────────────────────────────────
@@ -141,6 +226,10 @@ void ArrangeView::paint(juce::Graphics& g) {
 
     drawRuler(g);
     drawPlayhead(g);
+
+    // Draw drag ghost on top of everything else in the clip area
+    if (draggingClip_)
+        drawDragGhost(g);
 
     // Header / clip-area divider
     g.setColour(kBarLine);
@@ -271,8 +360,15 @@ void ArrangeView::drawClipLane(juce::Graphics& g,
     const float cy         = float(lane.getY()) + 4.f;
     const float ch         = float(lane.getHeight()) - 8.f;
 
-    for (const Clip& clip : t.clips) {
-        const float cx = float(kHeaderW) + beatToX(clip.startBeat);
+    for (int ci = 0; ci < (int)t.clips.size(); ++ci) {
+        const Clip& clip = t.clips[ci];
+
+        // If this is the clip being dragged, show it at the drag position
+        double displayBeat = clip.startBeat;
+        if (draggingClip_ && dragTrackIdx_ == row && dragClipIdx_ == ci)
+            displayBeat = dragCurrentBeat_;
+
+        const float cx = float(kHeaderW) + beatToX(displayBeat);
         const float cw = float(clip.lenBeats) * pixelsPerBeat_ - 2.f;
         if (cx + cw < float(kHeaderW)) continue;
         if (cx > laneRight)             break;
@@ -359,24 +455,168 @@ void ArrangeView::drawPlayhead(juce::Graphics& g) const {
     g.fillPath(tri);
 }
 
+void ArrangeView::drawDragGhost(juce::Graphics& g) const {
+    if (dragTrackIdx_ < 0 || dragTrackIdx_ >= (int)tracks_.size()) return;
+    if (dragClipIdx_  < 0 || dragClipIdx_  >= (int)tracks_[dragTrackIdx_].clips.size()) return;
+
+    const Track& t    = tracks_[dragTrackIdx_];
+    const Clip&  clip = t.clips[dragClipIdx_];
+    const auto   lane = laneBounds(dragTrackIdx_);
+    const float  cy   = float(lane.getY()) + 4.f;
+    const float  ch   = float(lane.getHeight()) - 8.f;
+    const float  cx   = float(kHeaderW) + beatToX(dragCurrentBeat_);
+    const float  cw   = float(clip.lenBeats) * pixelsPerBeat_ - 2.f;
+
+    // Semi-transparent ghost outline
+    g.setColour(t.color.withAlpha(0.45f));
+    g.fillRoundedRectangle({ cx, cy, cw, ch }, 5.f);
+    g.setColour(t.color.brighter(0.3f).withAlpha(0.8f));
+    g.drawRoundedRectangle({ cx, cy, cw, ch }, 5.f, 1.5f);
+}
+
 // ─────────────────────────────────────────────────────────────────
 //  Mouse
 // ─────────────────────────────────────────────────────────────────
 
 void ArrangeView::mouseDown(const juce::MouseEvent& e) {
+    // ── Ruler drag: click in ruler area (above track lane) ────────
     if (e.y < kRulerH && e.x >= kHeaderW) {
         rulerDrag_    = true;
         playheadBeat_ = std::max(0.0, xToBeat(float(e.x - kHeaderW)));
         repaint(rulerBounds());
         repaint(clipAreaBounds());
+        return;
+    }
+
+    rulerDrag_ = false;
+
+    const int row = rowAtY(e.y);
+    if (row < 0) return;
+
+    // ── Track header click ─────────────────────────────────────────
+    if (e.x < kHeaderW) {
+        const auto r = headerBounds(row);
+        auto& t = tracks_[row];
+
+        // Mute button area: right side of header, lower portion
+        const juce::Rectangle<int> muteBtn  { r.getRight() - 46, r.getY() + 26, 18, 13 };
+        const juce::Rectangle<int> soloBtn  { r.getRight() - 24, r.getY() + 26, 18, 13 };
+
+        if (muteBtn.contains(e.x, e.y)) {
+            t.muted = !t.muted;
+            if (cmdBus_ && t.sessionTrackId.isNotEmpty())
+                cmdBus_->setTrackMuted(t.sessionTrackId, t.muted);
+            if (onTrackMuteToggled && t.sessionTrackId.isNotEmpty())
+                onTrackMuteToggled(t.sessionTrackId);
+            repaint(r);
+        } else if (soloBtn.contains(e.x, e.y)) {
+            t.soloed = !t.soloed;
+            if (cmdBus_ && t.sessionTrackId.isNotEmpty())
+                cmdBus_->setTrackSoloed(t.sessionTrackId, t.soloed);
+            if (onTrackSoloToggled && t.sessionTrackId.isNotEmpty())
+                onTrackSoloToggled(t.sessionTrackId);
+            repaint(r);
+        }
+        return;
+    }
+
+    // ── Clip area click ────────────────────────────────────────────
+    {
+        const double clickBeat = xToBeat(float(e.x - kHeaderW));
+        const int ci = clipIndexAtBeat(row, clickBeat);
+
+        if (ci >= 0) {
+            const auto& clip = tracks_[row].clips[ci];
+
+            // Double click → open piano roll / detail view
+            if (e.getNumberOfClicks() >= 2) {
+                if (onClipDoubleClicked && clip.sessionClipId.isNotEmpty())
+                    onClipDoubleClicked(clip.sessionClipId);
+                return;
+            }
+
+            // Begin clip drag
+            draggingClip_     = true;
+            dragTrackIdx_     = row;
+            dragClipIdx_      = ci;
+            dragStartBeat_    = clip.startBeat;
+            dragCurrentBeat_  = clip.startBeat;
+            dragMouseStartX_  = float(e.x);
+        }
     }
 }
 
 void ArrangeView::mouseDrag(const juce::MouseEvent& e) {
-    if (!rulerDrag_) return;
-    playheadBeat_ = std::max(0.0, xToBeat(float(e.x - kHeaderW)));
-    repaint(rulerBounds());
+    if (rulerDrag_) {
+        playheadBeat_ = std::max(0.0, xToBeat(float(e.x - kHeaderW)));
+        repaint(rulerBounds());
+        repaint(clipAreaBounds());
+        return;
+    }
+
+    if (!draggingClip_) return;
+
+    // Compute new beat position, snapped to quarter-beat grid
+    const float deltaX    = float(e.x) - dragMouseStartX_;
+    const double deltaBeat = static_cast<double>(deltaX) / pixelsPerBeat_;
+    double newBeat = dragStartBeat_ + deltaBeat;
+
+    // Snap to 0.25-beat grid
+    newBeat = std::round(newBeat * 4.0) / 4.0;
+    newBeat = std::max(0.0, newBeat);
+
+    if (newBeat != dragCurrentBeat_) {
+        dragCurrentBeat_ = newBeat;
+        repaint(clipAreaBounds());
+    }
+}
+
+void ArrangeView::mouseUp(const juce::MouseEvent& e) {
+    if (rulerDrag_) {
+        rulerDrag_ = false;
+        return;
+    }
+
+    if (!draggingClip_) return;
+
+    const double finalBeat = dragCurrentBeat_;
+    const int    ti        = dragTrackIdx_;
+    const int    ci        = dragClipIdx_;
+
+    // Commit the new beat position
+    if (ti >= 0 && ti < (int)tracks_.size() &&
+        ci >= 0 && ci < (int)tracks_[ti].clips.size())
+    {
+        auto& clip = tracks_[ti].clips[ci];
+
+        // Only commit if the position actually changed
+        if (std::abs(finalBeat - dragStartBeat_) > 1e-6) {
+            clip.startBeat = finalBeat;
+
+            // Notify via command bus (undo-able)
+            if (cmdBus_ && clip.sessionClipId.isNotEmpty() &&
+                tracks_[ti].sessionTrackId.isNotEmpty()) {
+                cmdBus_->moveClip(tracks_[ti].sessionTrackId,
+                                  clip.sessionClipId,
+                                  finalBeat);
+            }
+
+            // Notify callback
+            if (onClipMoved && clip.sessionClipId.isNotEmpty() &&
+                tracks_[ti].sessionTrackId.isNotEmpty()) {
+                onClipMoved(tracks_[ti].sessionTrackId,
+                            clip.sessionClipId,
+                            finalBeat);
+            }
+        }
+    }
+
+    draggingClip_  = false;
+    dragTrackIdx_  = -1;
+    dragClipIdx_   = -1;
     repaint(clipAreaBounds());
+
+    juce::ignoreUnused(e);
 }
 
 void ArrangeView::mouseWheelMove(const juce::MouseEvent& e,
